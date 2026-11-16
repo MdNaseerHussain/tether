@@ -4,6 +4,20 @@ This document is the implementation contract for the packages under `internal/` 
 `cmd/`. If code and this document disagree, this document wins until it is revised
 in the same change.
 
+## 0. Implementation status (v0.1.0)
+
+Implemented: PTY allocation and the raw-mode client engine, the sequence-numbered
+ring buffer with exclusive-cursor replay, the rate-limited reconnect loop with
+exponential backoff and jitter, detach, `tetherd list`/`kill`, and cleanup of the
+socket, pid file and metadata on normal exit, `SIGTERM` and protocol `Kill`.
+
+Not implemented yet (designed below, do not assume): the client-side bootstrap in
+§11 (there is **no** SFTP/SCP upload, so `tetherd` must already be on the remote
+host), `~/.ssh/config` parsing (§6/§7 — pass `-i`, `-p`, and a literal host), the
+`tether` SSH *subsystem* channel (the client currently execs
+`tetherd attach --session <id> --spawn`), and multi-device attach as a supported
+feature (the daemon has no "one client" lock, but the UX is untested).
+
 ## 1. Goals and non-goals
 
 **Goals**
@@ -40,11 +54,11 @@ in the same change.
  │    └─ reconnect loop (backoff, replay from LastAckSeq)                     │
  │        │                                                                  │
  └────────┼──────────────────────────────────────────────────────────────────┘
-          │  TCP :22  ── SSH user auth (agent / key / config) ── "tether" subsystem
-          │  channel: framed proto messages (see docs/PROTOCOL.md)
+          │  TCP :22  ── SSH user auth (agent / key / password) ── exec channel
+          │  running `tetherd attach`: framed proto (docs/PROTOCOL.md)
           ▼
  ┌────────────────────────────── Remote host ────────────────────────────────┐
- │  sshd ──> tetherd serve  (one process per SSH channel; short lived)        │
+ │  sshd ──> tetherd attach  (bridge; lives exactly as long as the channel)  │
  │              │                                                            │
  │              │ connect(2) to ~/.tether/sessions/<id>.sock (0600)          │
  │              ▼                                                            │
@@ -218,8 +232,9 @@ While the terminal is in raw mode the client retries forever:
 Every delay is jittered by ±20 % (`d * (0.8 + 0.4*rand.Float64())`). The delay
 resets to 500 ms after a successful attach that survives one heartbeat interval.
 
-Reconnect re-dials SSH using the user's existing configuration (`~/.ssh/config`,
-agent, identity files) and re-attaches to the same session id. If the host is
+Reconnect re-dials SSH using the user's ssh-agent and identity files
+(`SSH_AUTH_SOCK`, `-i`, or `~/.ssh/id_*`) and re-attaches to the same session id.
+`~/.ssh/config` is not parsed, so use a literal host plus `-i`/`-p`. If the host is
 unreachable the loop continues indefinitely; it never exits on its own while
 disconnected.
 
@@ -346,9 +361,11 @@ single `Write` call but does not add locking; callers serialise.
 | Reconnect backoff | 500 ms doubling to 5 s, ±20 % |
 | Attach queue wait | 5 s, then `TypeError` |
 
-## 11. Bootstrap (client-side)
+## 11. Bootstrap (client-side) — planned, not in v0.1.0
 
-If `tetherd version` fails on the remote host, `tether` stages it once:
+If `tetherd version` fails on the remote host, `tether` will one day stage it; as
+shipped today it fails with `tetherd not found on <host>; install tetherd or pass
+--remote-bin <path>`. The design:
 
 1. Detect remote `GOOS`/`GOARCH` (`uname -s`, `uname -m`).
 2. Upload the matching embedded/prebuilt static binary to

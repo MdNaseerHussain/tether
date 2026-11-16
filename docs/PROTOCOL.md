@@ -7,8 +7,9 @@ together.
 ## 1. Transport
 
 The protocol runs over a single bidirectional byte stream: the SSH channel
-created by requesting the `tether` subsystem (`ssh -s host tether`) or by running
-`tetherd attach <id>` over an exec channel as a fallback.
+created by running `tetherd attach --session <id> --spawn` over an SSH exec
+channel. (A dedicated `tether` subsystem is reserved for a later revision; v0.1.0
+does not install one.)
 
 Properties the protocol relies on and does not provide itself:
 
@@ -359,9 +360,8 @@ message and must not reuse the buffer while holding the view.
 2. Changing a payload layout requires a `ProtocolVersion` bump. A peer must never
    interpret a payload of the wrong width — `UnmarshalBinary` returns
    `ErrShortPayload` for any unexpected length.
-3. `Hello.Version` is the only negotiation. There is no downgrade path; both
-   binaries ship together through `tether`'s bootstrap (§11 of the architecture
-   doc).
+3. `Hello.Version` is the only negotiation. There is no downgrade path: install
+   matching versions by hand in v0.1.0 (the client does not bootstrap `tetherd`).
 4. Reserved for later: `TypeHello` environment/tags fields, `Data` compression
    flag bits, `Ack` cumulative drop counters. None exist in version 1; the frame
    length is what future readers use to detect them.

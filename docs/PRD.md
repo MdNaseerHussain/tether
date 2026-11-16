@@ -4,7 +4,7 @@
 **Author:** Naseer Hussain  
 **Status:** Draft / Active Review  
 **Target Release:** v0.1.0 (MVP)  
-**Language / Stack:** Go (1.22+), POSIX Unix PTY, SSH Protocol  
+**Language / Stack:** Go (1.26+), POSIX Unix PTY, SSH Protocol  
 
 ---
 

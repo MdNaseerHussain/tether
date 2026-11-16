@@ -1,8 +1,8 @@
 # tether
 
-> **The persistent, zero-config terminal session proxy for remote development and long-running AI streams over SSH.**
+> **The persistent terminal session proxy for remote development and long-running AI streams over SSH.**
 
-[License: MIT](LICENSE) [Go Report Card](https://goreportcard.com/report/github.com/naseer-hussain/tether) ![](https://img.shields.io/badge/go-1.22%2B-00ADD8)
+[License: MIT](LICENSE) [Go Report Card](https://goreportcard.com/report/github.com/naseer-hussain/tether) ![](https://img.shields.io/badge/go-1.26%2B-00ADD8)
 
 ---
 
@@ -16,7 +16,7 @@ When using standard SSH:
 * Existing workarounds like **Mosh** require opening high UDP ports (blocked by corporate firewalls), break native terminal scrollback, and mangle **OSC 52** clipboard synchronization.
 * Workarounds like **`tmux`** hijack terminal mouse selection, split clipboard buffers, and add intrusive keybinding layers.
 
-**`tether` solves this seamlessly.** It is a lightweight, single-binary Go client-daemon pair that tunnels over your existing SSH configuration. When your connection drops, `tetherd` keeps your shell alive on the remote server, buffers output in a rolling ring buffer, and instantly re-attaches and replays missed tokens the second your laptop wakes up.
+**`tether` solves this seamlessly.** It is a lightweight, two-binary Go client-daemon pair that runs over the SSH transport you already have: `tether` on your laptop and `tetherd` on the remote host (installed once — v0.1.0 does not upload it for you). When your connection drops, `tetherd` keeps your shell alive on the remote server, buffers output in a rolling ring buffer, and instantly re-attaches and replays missed tokens the second your laptop wakes up.
 
 ---
 
@@ -26,7 +26,7 @@ When using standard SSH:
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Survives Laptop Sleep & Wi-Fi Handoffs** | ❌ No | ✅ Yes | ✅ Yes | ⚠️ Manual Re-attach | ✅ **Seamless Auto-Resume** |
 | **Preserves Long-Running AI/CLI Streams** | ❌ Drops stream | ⚠️ Re-renders screen | ⚠️ Buffer replay | ⚠️ Manual reconnect | ✅ **In-Memory Ring Buffer Replay** |
-| **Network & Firewall Requirements** | Standard Port 22 | High UDP (60000–61000) | Custom TCP (Port 2022) | Standard Port 22 | **Standard Port 22 (SSH Subsystem)** |
+| **Network & Firewall Requirements** | Standard Port 22 | High UDP (60000–61000) | Custom TCP (Port 2022) | Standard Port 22 | **Standard Port 22 (SSH Exec Channel)** |
 | **Native OS Copy & Paste (OSC 52)** | ✅ Native | ❌ Stripped/Broken | ⚠️ Partial | ❌ Hijacked / Broken | ✅ **Zero-Interference Passthrough** |
 | **Native Terminal Scrollback** | ✅ Yes | ❌ Requires screen hack | ✅ Yes | ❌ Requires copy-mode | ✅ **Native Local Terminal Buffer** |
 | **Root / Sudo Privileges Required** | ❌ No | ❌ No | ⚠️ Yes (Daemon install) | ❌ No | ❌ **Zero Root / Pure User Space** |
@@ -65,10 +65,10 @@ When using standard SSH:
                                                              └──────────────────┘
 ```
 
-1. **Local Client (`tether`):** Switches your local terminal into raw mode and captures signals (like `SIGWINCH` for terminal resizing). It connects to the remote machine via standard SSH.
-2. **Server Daemon (`tetherd`):** Launched automatically in the background on the remote server (or bootstrapped via SSH). It creates a Unix Pseudo-Terminal (PTY) and spawns your default shell.
+1. **Local Client (`tether`):** Switches your local terminal into raw mode and captures signals (like `SIGWINCH` for terminal resizing). It authenticates over standard SSH using `ssh-agent`, an identity file (`-i`), the default keys under `~/.ssh`, or an interactive password prompt, then runs `tetherd attach` on the remote host.
+2. **Server Daemon (`tetherd`):** Started on the remote server by the client with `tetherd attach --spawn`, or explicitly with `tetherd serve`. **It must already be installed on the remote host.** It creates a Unix Pseudo-Terminal (PTY) and spawns your shell in its own process session (`setsid`), so it outlives the SSH channel.
 3. **Rolling Stream Buffer:** Terminal output is continuously pushed into an in-memory rolling ring buffer (default: 4 MB). If the client disconnects, stdout writes do not block or fail.
-4. **Resumption Handshake:** When your laptop wakes up, `tether` reconnects to the existing session token, synchronizes terminal window dimensions, and replays unacknowledged bytes.
+4. **Resumption Handshake:** When your laptop wakes up, `tether` re-dials SSH and re-authenticates with your agent/keys (there is no session token to store), attaches to the same session id, synchronizes terminal window dimensions, and replays unacknowledged bytes from the last acknowledged sequence number.
 
 ---
 
@@ -91,15 +91,27 @@ Download the latest static binary for macOS (`arm64`/`amd64`) or Linux (`amd64`/
 
 ### 2. Usage
 
-Connecting with `tether` uses the exact same syntax as your regular `ssh` command:
+`tether` takes the same `[user@]host` shape as `ssh`, plus its own flags:
 
 ```bash
-# Connect to your remote host (auto-bootstraps tetherd if needed)
+# Attach to (or create) the "default" session on the remote host.
+# tetherd must already be on the remote $PATH (see Development).
 tether user@cloudtop.corp.internal
 
-# Connect using custom SSH keys or ports
-tether -i ~/.ssh/id_ed25519 -p 2222 developer@devbox.internal
+# Custom key + port, and a named session.
+tether -i ~/.ssh/id_ed25519 -p 2222 --session dev developer@devbox.internal
+
+# Remote binary outside $PATH, or a non-default known_hosts file.
+tether --remote-bin ~/.local/bin/tetherd --known-hosts ~/.ssh/known_hosts user@host
+
+# Explicit user (same as user@host), custom detach sequence, and a larger buffer
+# for the session if it has to be created.
+tether -l deploy --escape '~^' --buffer-size 8388608 host.example.com
 ```
+
+Host, user, port and key are resolved from these flags, your ssh-agent and the
+default keys under `~/.ssh`; `~/.ssh/config` aliases and `ProxyJump` are **not**
+parsed. Pass `--insecure` only to skip host-key verification for a throwaway host.
 
 ### 3. Verify Resilience
 
@@ -120,19 +132,21 @@ tether -i ~/.ssh/id_ed25519 -p 2222 developer@devbox.internal
 * **Zero-Firewall Friction:** Works entirely through standard SSH transport (port 22). No open UDP ports or firewall tickets required.
 * **Stream-Safe Ring Buffer:** Maintains an in-memory rolling buffer so active AI agents never crash from broken pipes while you are offline.
 * **Native Clipboard (OSC 52):** Uninterrupted bi-directional clipboard sync. Copying text in Vim or terminal tools uses your local system clipboard out of the box.
-* **Invisible UX:** No status bars, no screen splitting, no custom escape keybindings (`Ctrl+B`). Your terminal behaves exactly like a native terminal.
-* **Self-Bootstrapping Daemon:** If `tetherd` is not installed on the remote machine, the client can auto-stage a standalone static binary over SFTP/SCP into `~/.local/bin/`.
+* **Invisible UX:** No status bars, no screen splitting, no custom escape keybindings (`Ctrl+B`). Your terminal behaves exactly like a native terminal (`~.` detaches, configurable with `--escape`).
+* **Key- or agent-based reconnect:** A dropped channel is re-dialled with your ssh-agent or on-disk keys; no separate session token is issued or stored.
+* **Requires `tetherd` on the remote host:** Install it once (static binary, no root, no extra port). Automatic remote bootstrap over SFTP is designed ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11) but **not implemented in v0.1.0**.
 
 ---
 
 ## Roadmap
 
 - [x] Initial architecture specification and PTY session lifecycle design
-- [ ] Core PTY allocation and raw-mode client engine in Go
-- [ ] Ring buffer stream capture and sequence replay
-- [ ] Reconnection state machine with exponential backoff
+- [x] Core PTY allocation and raw-mode client engine in Go
+- [x] Ring buffer stream capture and sequence replay
+- [x] Reconnection state machine with exponential backoff
 - [ ] Automated remote bootstrap over standard SSH
-- [ ] Session detachment and multi-device attach support
+- [ ] Session detachment and multi-device attach support (detach is implemented;
+      the daemon accepts concurrent attaches, but multi-device use is not advertised yet)
 
 ---
 
@@ -164,6 +178,6 @@ make test
 
 `make check` additionally verifies formatting with `gofmt` and runs `go vet`, which is what CI enforces. `make cross` produces static (`CGO_ENABLED=0`) release binaries for Linux and macOS on `amd64` and `arm64`, and `make install` puts them in `$(go env GOPATH)/bin`.
 
-Note that `tether` alone is not enough: **`tetherd` must be installed on the remote host** you want to connect to (or reachable on its `PATH`, for example in `~/.local/bin`). The client launches it through an SSH subsystem channel and it is the daemon that keeps the session alive across disconnects.
+Note that `tether` alone is not enough: **`tetherd` must be installed on the remote host** you want to connect to (or reachable on its `PATH`, for example in `~/.local/bin`). The client launches it with `tetherd attach --spawn` over an SSH exec channel, and it is the daemon that keeps the session alive across disconnects. Reconnect re-authenticates with your ssh-agent or key files; no session token is stored.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component design and [docs/PROTOCOL.md](docs/PROTOCOL.md) for the byte-level wire format.

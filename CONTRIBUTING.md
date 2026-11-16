@@ -21,7 +21,7 @@ make test    # go test -race ./...
 make check   # gofmt check + go vet + race tests (what CI runs)
 ```
 
-Requirements: Go 1.22 or newer. No cgo, no external services, no network access
+Requirements: Go 1.26 or newer. No cgo, no external services, no network access
 in tests.
 
 ## Expectations for a pull request
