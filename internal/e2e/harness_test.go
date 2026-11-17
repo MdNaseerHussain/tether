@@ -33,13 +33,11 @@ const (
 	// sshConnectTimeout bounds one dial plus handshake. It is passed to the
 	// real client, so a stalled blackholed handshake fails on this deadline.
 	sshConnectTimeout = "3s"
-	// blackholeWindow is how long the link stays dead. A reconnect must happen
-	// only after the 9 s dead-peer limit has elapsed, and that limit is measured
-	// from the last inbound frame: the stream keeps producing output for ~2 s
-	// after the link dies, and the ping ticker may be up to 3 s away from the
-	// moment the limit expires. 12 s of slack plus the 2 s of output is the
-	// worst case, so 16 s guarantees the client has given up before the heal.
-	blackholeWindow = 16 * time.Second
+	// blackholeWindow is exactly how long the link stays dead. The client must
+	// notice the dead peer at nine silent seconds (three missed 3 s heartbeats)
+	// and dial again before the heal, so ten seconds is both the scenario the
+	// heartbeat budget promises and a hard upper bound on detection latency.
+	blackholeWindow = 10 * time.Second
 )
 
 // errNoGoTool marks a build failure that should skip rather than fail.
@@ -163,14 +161,19 @@ func eventually(t *testing.T, timeout time.Duration, what string, cond func() bo
 	}
 }
 
-var streamLine = regexp.MustCompile(`LINE ([0-9]{5})`)
+var (
+	// lineMarker matches the numbered lines of the replay workload.
+	lineMarker = regexp.MustCompile(`LINE ([0-9]{5})`)
+	// tickMarker matches the once-a-second ticks of the heartbeat workload.
+	tickMarker = regexp.MustCompile(`TICK ([0-9]{5})`)
+)
 
 // scanStream walks the client's stdout as a state machine and reports which
-// LINE number is expected next plus every duplicate or gap it saw. It tolerates
+// number is expected next plus every duplicate or gap it saw. It tolerates
 // arbitrary bytes around the marker (ANSI/OSC escapes, CR from the remote PTY)
 // but requires the numbers themselves to be strictly consecutive, which is the
 // exactly-once claim: no duplicates and no gaps.
-func scanStream(data []byte) (next int, problems []string) {
+func scanStream(data []byte, marker *regexp.Regexp) (next int, problems []string) {
 	next = 1
 	rest := data
 	for {
@@ -180,7 +183,7 @@ func scanStream(data []byte) (next int, problems []string) {
 		}
 		line := rest[:i]
 		rest = rest[i+1:]
-		m := streamLine.FindSubmatch(line)
+		m := marker.FindSubmatch(line)
 		if m == nil {
 			continue
 		}
@@ -193,11 +196,11 @@ func scanStream(data []byte) (next int, problems []string) {
 			next = n + 1
 		case n < next:
 			if len(problems) < 8 {
-				problems = append(problems, fmt.Sprintf("duplicate LINE %05d (expected %05d)", n, next))
+				problems = append(problems, fmt.Sprintf("duplicate %s %05d (expected %05d)", marker.String(), n, next))
 			}
 		default:
 			if len(problems) < 8 {
-				problems = append(problems, fmt.Sprintf("gap: saw LINE %05d, expected %05d", n, next))
+				problems = append(problems, fmt.Sprintf("gap: saw %s %05d, expected %05d", marker.String(), n, next))
 			}
 			next = n + 1
 		}
@@ -322,6 +325,9 @@ type sshFixture struct {
 	srv *sshServer
 	prx *proxy
 
+	// marker selects the numbered workload output scanStream validates.
+	marker *regexp.Regexp
+
 	client *clientProc
 	pty    *ptyProc
 }
@@ -367,6 +373,7 @@ func newSSHFixture(t *testing.T, scriptBody, session string) *sshFixture {
 		session:    session,
 		srv:        srv,
 		prx:        prx,
+		marker:     lineMarker,
 	}
 	t.Cleanup(func() { f.forceCleanup(t) })
 	return f
@@ -506,8 +513,8 @@ func (f *sshFixture) dump(stdout, stderr []byte) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "fixture: session=%q home=%s script=%s\n", f.session, f.home, f.script)
 	fmt.Fprintf(&b, "proxy: accepted=%d  ssh execs=%d  auths=%d\n", f.prx.Accepted(), f.srv.ExecCount(), f.srv.AuthCount())
-	next, problems := scanStream(stdout)
-	fmt.Fprintf(&b, "stream: next LINE %05d (consumed %d), problems=%v\n", next, next-1, problems)
+	next, problems := scanStream(stdout, f.marker)
+	fmt.Fprintf(&b, "stream: next %s (consumed %d), problems=%v\n", f.marker.String(), next-1, problems)
 	fmt.Fprintf(&b, "--- client stdout (%d bytes) ---\n%s\n", len(stdout), stdout)
 	fmt.Fprintf(&b, "--- client stderr (%d bytes) ---\n%s\n", len(stderr), stderr)
 	fmt.Fprintf(&b, "--- ssh exec log ---\n%s\n", f.srv.ExecLog())

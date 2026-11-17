@@ -66,6 +66,12 @@ const (
 	heartbeatEvery = 3 * time.Second
 	heartbeatLimit = 9 * time.Second
 
+	// livenessEvery is how often the dead-peer deadline is evaluated. It is
+	// deliberately much smaller than heartbeatEvery: detection must not be
+	// quantised to the ping cadence, or three missed heartbeats would only be
+	// noticed on the next 3 s tick (up to 12 s instead of the promised 9 s).
+	livenessEvery = 250 * time.Millisecond
+
 	reconnectInitial = 500 * time.Millisecond
 	reconnectMax     = 5 * time.Second
 
@@ -698,12 +704,17 @@ func (a *attach) readFailure(err error) sessionResult {
 }
 
 // writeLoop forwards stdin, acks delivered bytes, serialises SIGWINCH into
-// Resize frames, and runs the heartbeat.
+// Resize frames, runs the heartbeat and watches the dead-peer deadline.
 func (a *attach) writeLoop(stop <-chan struct{}) sessionResult {
 	ackTicker := time.NewTicker(ackEvery)
 	defer ackTicker.Stop()
 	pingTicker := time.NewTicker(heartbeatEvery)
 	defer pingTicker.Stop()
+	// The liveness watchdog is separate from the ping ticker so the 9 s
+	// dead-peer verdict lands within livenessEvery of the deadline, no matter
+	// where the last ping fell.
+	liveness := time.NewTicker(livenessEvery)
+	defer liveness.Stop()
 
 	sentAck := a.ack.Load()
 
@@ -744,15 +755,22 @@ func (a *attach) writeLoop(stop <-chan struct{}) sessionResult {
 			}
 
 		case <-pingTicker.C:
-			if silent := time.Since(time.Unix(0, a.lastPong.Load())); silent > heartbeatLimit {
-				_ = a.ch.SetDeadline(time.Now())
-				return sessionResult{
-					kind: resultReconnect,
-					err:  fmt.Errorf("no reply for %s", silent.Round(time.Second)),
-				}
-			}
 			if err := a.w.write(proto.Message{Type: proto.TypePing}); err != nil {
 				return sessionResult{kind: resultReconnect, err: err}
+			}
+
+		case <-liveness.C:
+			lastInbound := time.Unix(0, a.lastPong.Load())
+			if !heartbeatExpired(lastInbound, time.Now()) {
+				continue
+			}
+			// Force the parked reads and writes to fail; the reconnect loop
+			// then runs exactly as it does for a broken connection.
+			silent := time.Since(lastInbound)
+			_ = a.ch.SetDeadline(time.Now())
+			return sessionResult{
+				kind: resultReconnect,
+				err:  fmt.Errorf("no reply for %s", silent.Round(time.Second)),
 			}
 
 		case <-a.winch:
@@ -778,6 +796,17 @@ func (a *attach) sendResize(rows, cols uint16) error {
 
 func (a *attach) markAlive() {
 	a.lastPong.Store(time.Now().UnixNano())
+}
+
+// heartbeatExpired reports whether the connection has been silent for longer
+// than the dead-peer limit. Any inbound frame refreshes lastInbound, so the
+// limit is measured from the last Pong or Data byte, per docs/PROTOCOL.md §6
+// (three missed heartbeats at 3 s each).
+func heartbeatExpired(lastInbound, now time.Time) bool {
+	if lastInbound.IsZero() {
+		return false
+	}
+	return now.Sub(lastInbound) > heartbeatLimit
 }
 
 // lastAckFor returns the highest sequence number covered by a Data frame that

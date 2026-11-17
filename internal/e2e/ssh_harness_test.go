@@ -18,8 +18,8 @@ import (
 	"github.com/creack/pty"
 )
 
-// streamScript is the "remote workload" for the replay and heartbeat tests. It
-// emits a numbered line every 5 ms and then holds the PTY open, which is what a
+// streamScript is the "remote workload" for the replay test. It emits a
+// numbered line every 5 ms and then holds the PTY open, which is what a
 // long-running chat or build would do.
 const streamScript = `#!/bin/sh
 i=0
@@ -29,6 +29,19 @@ while [ $i -lt 400 ]; do
 	sleep 0.005
 done
 sleep 600
+`
+
+// tickScript emits one timestamped tick per second and never stops. The pace is
+// deliberate: the client's liveness clock is measured from the last inbound
+// frame, so waiting for a tick before cutting the link pins the 9 s dead-peer
+// deadline to the blackhole instant instead of to some earlier frame.
+const tickScript = `#!/bin/sh
+i=0
+while :; do
+	i=$((i+1))
+	printf 'TICK %05d\n' "$i"
+	sleep 1
+done
 `
 
 // sizeScript reports the PTY geometry continuously, so a resize is visible as a
@@ -83,13 +96,13 @@ func TestSSHMidStreamDropReplays(t *testing.T) {
 	// Ack semantics: the replay must resume exactly after the last byte the
 	// client acknowledged, so the concatenated stdout is the original stream.
 	replayed := eventually(t, 25*time.Second, "all 400 lines exactly once and in order", func() bool {
-		next, problems := scanStream(c.stdout.Bytes())
+		next, problems := scanStream(c.stdout.Bytes(), f.marker)
 		return len(problems) == 0 && next == 401
 	}, func() string { return f.dumpClient(c) })
 	t.Logf("drop: LINE 00020 after %s; the other 380 lines arrived in %s after the drop",
 		first.Round(time.Millisecond), replayed.Round(time.Millisecond))
 
-	if next, problems := scanStream(c.stdout.Bytes()); next != 401 || len(problems) != 0 {
+	if next, problems := scanStream(c.stdout.Bytes(), f.marker); next != 401 || len(problems) != 0 {
 		t.Fatalf("stream is not exactly-once: consumed %d lines, problems %v", next-1, problems)
 	}
 
@@ -105,61 +118,90 @@ func TestSSHMidStreamDropReplays(t *testing.T) {
 	f.stop(t)
 }
 
-// TestSSHBlackholeTriggersHeartbeatTimeout stops forwarding without closing the
-// TCP connection. The client cannot learn about the dead path from the socket,
-// so only the 3 s ping / 9 s dead-peer timer can tear it down. The lower bound
-// on the reconnect delay is what proves that.
+// The dead-link test stops forwarding without closing the TCP connection for
+// exactly ten seconds. Only the 3 s ping / 9 s dead-peer timer can tear the old
+// transport down, so the proof is a *new* TCP connection arriving at the proxy
+// while the link is still dead, at least 8.5 s in.
 func TestSSHBlackholeTriggersHeartbeatTimeout(t *testing.T) {
 	if testing.Short() {
-		t.Skip("the blackhole test holds a dead link open for the heartbeat window")
+		t.Skip("the dead-link test holds a blackholed transport open for the heartbeat window")
 	}
-	f := newSSHFixture(t, streamScript, "blackhole")
+	f := newSSHFixture(t, tickScript, "heartbeat")
+	f.marker = tickMarker
 	c := f.startClient(t)
 
-	eventually(t, 20*time.Second, "LINE 00020 on the client's stdout", func() bool {
-		return bytes.Contains(c.stdout.Bytes(), []byte("LINE 00020"))
+	// Liveness is measured from the last inbound frame, so cut the link right
+	// after a tick reaches stdout: from then on every tick is produced while the
+	// path is dead and only the daemon's ring buffer can preserve it.
+	eventually(t, 20*time.Second, "TICK 00003 on the client's stdout", func() bool {
+		return bytes.Contains(c.stdout.Bytes(), []byte("TICK 00003"))
 	}, func() string { return f.dumpClient(c) })
 
 	t0 := time.Now()
 	f.prx.Blackhole()
 
-	// Nothing must reconnect while the path is dead: no TCP error, no reset.
-	<-time.After(blackholeWindow)
-	if got := f.srv.ExecCount(); got != 1 {
-		t.Fatalf("client reconnected while the link was blackholed (%d execs); the tear-down did not come from the heartbeat\n%s",
-			got, f.dumpClient(c))
+	// The client may only give up on the strength of the heartbeat: a TCP error
+	// would reconnect in well under a second.
+	if err := f.prx.WaitAccepted(2, blackholeWindow); err != nil {
+		t.Fatalf("%v; the client did not open a second connection while the link was blackholed\n%s",
+			err, f.dumpClient(c))
+	}
+	accepts := f.prx.AcceptTimes()
+	if len(accepts) < 2 {
+		t.Fatalf("proxy recorded %d accepts, want at least 2", len(accepts))
+	}
+	detection := accepts[1].Sub(t0)
+	t.Logf("heartbeat: the client abandoned the dead transport and dialled again after %s", detection.Round(time.Millisecond))
+	if detection < 8500*time.Millisecond {
+		t.Fatalf("second connection after %s is too fast to be the 9s dead-peer timeout", detection)
+	}
+	if detection >= blackholeWindow {
+		t.Fatalf("second connection after %s did not happen while the link was still blackholed", detection)
 	}
 
-	f.prx.Pass()
+	// The handshake must still be stalled inside the blackhole: no bytes cross,
+	// so no remote command can have started yet.
+	if got := f.srv.ExecCount(); got != 1 {
+		t.Fatalf("%d remote commands ran while the link was blackholed; the handshake did not stall", got)
+	}
 
-	eventually(t, 20*time.Second, "a reconnect after the link heals", func() bool {
+	// Hold the link dead for the rest of the ten-second window, then heal.
+	if wait := time.Until(t0.Add(blackholeWindow)); wait > 0 {
+		<-time.After(wait)
+	}
+	f.prx.Pass()
+	healAt := time.Now()
+	t.Logf("heartbeat: link healed %s after t0", healAt.Sub(t0).Round(time.Millisecond))
+
+	eventually(t, 6*time.Second, "a handshake and a second exec after the heal", func() bool {
 		return f.srv.ExecCount() >= 2
 	}, func() string { return f.dumpClient(c) })
-	elapsed := time.Since(t0)
-	t.Logf("blackhole: second exec %s after the link went dead (%s after the heal)",
-		elapsed.Round(time.Millisecond), (elapsed - blackholeWindow).Round(time.Millisecond))
+	execAt := time.Now()
+	elapsed := execAt.Sub(t0)
+	t.Logf("heartbeat: second exec %s after t0 (%s after the heal)",
+		elapsed.Round(time.Millisecond), execAt.Sub(healAt).Round(time.Millisecond))
 
-	// A TCP-level failure would reconnect in well under a second. Anything
-	// above 8.5 s can only come from the 9 s dead-peer limit (a tick may fire
-	// slightly after it). The exec itself arriving within milliseconds of the
-	// heal also proves the client had already given up and was parked in a
-	// stalled dial: a client that survived the blackhole would have kept its
-	// connection and never started a second remote command.
+	if sinceHeal := execAt.Sub(healAt); sinceHeal > 6*time.Second {
+		t.Fatalf("handshake took %s after the heal; the dial should already have been parked", sinceHeal)
+	}
 	if elapsed < 8500*time.Millisecond {
 		t.Fatalf("reconnect after %s is too fast to be the 9s heartbeat timeout", elapsed)
 	}
-	// Three 3 s ping ticks plus one backoff after a stalled handshake is the
-	// worst case; 22 s leaves room for scheduling without hiding a regression.
-	if elapsed > 22*time.Second {
+	if elapsed > 16*time.Second {
 		t.Fatalf("reconnect after %s exceeds the heartbeat budget", elapsed)
 	}
 
-	// The supervisor kept buffering while the client was unreachable, so the
-	// replay has to be complete and duplicate-free.
-	eventually(t, 20*time.Second, "all 400 lines exactly once and in order after the heal", func() bool {
-		next, problems := scanStream(c.stdout.Bytes())
-		return len(problems) == 0 && next == 401
+	// The supervisor kept buffering while the client was unreachable: every tick
+	// produced before the heal must be replayed once, in order, with no
+	// duplicates across the boundary, and the stream must be live again.
+	eventually(t, 8*time.Second, "12 consecutive ticks with no duplicates or gaps after the heal", func() bool {
+		next, problems := scanStream(c.stdout.Bytes(), f.marker)
+		return len(problems) == 0 && next >= 13
 	}, func() string { return f.dumpClient(c) })
+
+	if next, problems := scanStream(c.stdout.Bytes(), f.marker); len(problems) != 0 || next < 13 {
+		t.Fatalf("stream is not continuous across the blackhole: consumed %d ticks, problems %v", next-1, problems)
+	}
 
 	f.stop(t)
 }

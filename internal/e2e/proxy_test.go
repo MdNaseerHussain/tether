@@ -82,6 +82,7 @@ type proxy struct {
 	mu       sync.Mutex
 	conns    map[*proxyConn]struct{}
 	accepted int
+	accepts  []time.Time
 	closed   bool
 
 	wg sync.WaitGroup
@@ -131,6 +132,7 @@ func (p *proxy) acceptLoop() {
 		pc := &proxyConn{client: client, server: server}
 		p.conns[pc] = struct{}{}
 		p.accepted++
+		p.accepts = append(p.accepts, time.Now())
 		p.mu.Unlock()
 
 		p.wg.Add(2)
@@ -174,6 +176,15 @@ func (p *proxy) Accepted() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.accepted
+}
+
+// AcceptTimes returns the time each connection was accepted, in order. The
+// timestamp is taken when the client's TCP connection is answered, which is the
+// moment the client gave up on the old transport and started a new one.
+func (p *proxy) AcceptTimes() []time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Time(nil), p.accepts...)
 }
 
 // WaitAccepted blocks until n connections have been accepted or timeout
