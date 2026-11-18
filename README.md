@@ -78,7 +78,7 @@ When using standard SSH:
 
 #### Homebrew (macOS & Linux)
 ```bash
-brew install naseer-hussain/tap/tether
+brew install MdNaseerHussain/tap/tether
 ```
 
 #### Go Install

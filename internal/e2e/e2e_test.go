@@ -637,13 +637,30 @@ func TestSIGTERMCleanup(t *testing.T) {
 	}
 }
 
+// truePath resolves a portable "true" executable. macOS ships
+// /usr/bin/true while Linux typically has /bin/true, so hardcoding either
+// path breaks the other platform.
+func truePath(t *testing.T) string {
+	t.Helper()
+	if path, err := exec.LookPath("true"); err == nil {
+		return path
+	}
+	for _, path := range []string{"/bin/true", "/usr/bin/true"} {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	t.Fatalf("no true executable found in PATH=%q, /bin/true or /usr/bin/true", os.Getenv("PATH"))
+	return ""
+}
+
 // TestShellExitCleanup checks the normal-exit path: the shell ends, the
 // supervisor removes its files and exits 0.
 func TestShellExitCleanup(t *testing.T) {
 	bin := buildTetherd(t)
 	home := shortHome(t)
 
-	cmd := exec.Command(bin, "serve", "--home", home, "--session", "short", "--shell", "/bin/true")
+	cmd := exec.Command(bin, "serve", "--home", home, "--session", "short", "--shell", truePath(t))
 	c := startChild(t, cmd)
 	t.Cleanup(c.stop)
 	select {
