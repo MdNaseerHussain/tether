@@ -1,6 +1,6 @@
 VERSION ?= 0.1.0-dev
 
-MODULE   := github.com/naseer-hussain/tether
+MODULE   := github.com/MdNaseerHussain/tether
 LDFLAGS  := -X $(MODULE)/internal/version.Version=$(VERSION)
 GOFLAGS  ?=
 

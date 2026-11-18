@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/naseer-hussain/tether/internal/proto"
+	"github.com/MdNaseerHussain/tether/internal/proto"
 )
 
 const (

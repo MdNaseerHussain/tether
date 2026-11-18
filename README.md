@@ -2,7 +2,7 @@
 
 > **The persistent terminal session proxy for remote development and long-running AI streams over SSH.**
 
-[License: MIT](LICENSE) [Go Report Card](https://goreportcard.com/report/github.com/naseer-hussain/tether) ![](https://img.shields.io/badge/go-1.26%2B-00ADD8)
+[License: MIT](LICENSE) [Go Report Card](https://goreportcard.com/report/github.com/MdNaseerHussain/tether) ![](https://img.shields.io/badge/go-1.26%2B-00ADD8)
 
 ---
 
@@ -83,11 +83,11 @@ brew install naseer-hussain/tap/tether
 
 #### Go Install
 ```bash
-go install github.com/naseer-hussain/tether/cmd/tether@latest
+go install github.com/MdNaseerHussain/tether/cmd/tether@latest
 ```
 
 #### Pre-built Binaries
-Download the latest static binary for macOS (`arm64`/`amd64`) or Linux (`amd64`/`arm64`) from the [Releases](https://github.com/naseer-hussain/tether/releases) page.
+Download the latest static binary for macOS (`arm64`/`amd64`) or Linux (`amd64`/`arm64`) from the [Releases](https://github.com/MdNaseerHussain/tether/releases) page.
 
 ### 2. Usage
 

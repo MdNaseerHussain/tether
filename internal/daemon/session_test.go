@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/naseer-hussain/tether/internal/proto"
-	"github.com/naseer-hussain/tether/internal/version"
+	"github.com/MdNaseerHussain/tether/internal/proto"
+	"github.com/MdNaseerHussain/tether/internal/version"
 )
 
 // helperEnv marks a re-exec of the test binary as a real session supervisor.

@@ -16,9 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/naseer-hussain/tether/internal/proto"
-	"github.com/naseer-hussain/tether/internal/ringbuf"
-	"github.com/naseer-hussain/tether/internal/version"
+	"github.com/MdNaseerHussain/tether/internal/proto"
+	"github.com/MdNaseerHussain/tether/internal/ringbuf"
+	"github.com/MdNaseerHussain/tether/internal/version"
 	"golang.org/x/term"
 )
 

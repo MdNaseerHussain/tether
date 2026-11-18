@@ -15,8 +15,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/naseer-hussain/tether/internal/daemon"
-	"github.com/naseer-hussain/tether/internal/version"
+	"github.com/MdNaseerHussain/tether/internal/daemon"
+	"github.com/MdNaseerHussain/tether/internal/version"
 )
 
 const usage = `usage: tetherd <command> [flags]

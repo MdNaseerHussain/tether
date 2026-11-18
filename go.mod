@@ -1,4 +1,4 @@
-module github.com/naseer-hussain/tether
+module github.com/MdNaseerHussain/tether
 
 go 1.26.0
 

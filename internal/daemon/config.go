@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/naseer-hussain/tether/internal/ringbuf"
+	"github.com/MdNaseerHussain/tether/internal/ringbuf"
 )
 
 // Config describes one session supervisor: which shell to run, where its socket

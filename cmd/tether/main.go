@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/naseer-hussain/tether/internal/client"
-	"github.com/naseer-hussain/tether/internal/version"
+	"github.com/MdNaseerHussain/tether/internal/client"
+	"github.com/MdNaseerHussain/tether/internal/version"
 )
 
 func main() {
