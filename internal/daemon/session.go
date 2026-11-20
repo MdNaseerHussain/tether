@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+
 	"github.com/MdNaseerHussain/tether/internal/proto"
 	"github.com/MdNaseerHussain/tether/internal/ringbuf"
 	"github.com/MdNaseerHussain/tether/internal/version"
