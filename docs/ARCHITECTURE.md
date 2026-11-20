@@ -8,15 +8,16 @@ in the same change.
 
 Implemented: PTY allocation and the raw-mode client engine, the sequence-numbered
 ring buffer with exclusive-cursor replay, the rate-limited reconnect loop with
-exponential backoff and jitter, detach, `tetherd list`/`kill`, and cleanup of the
-socket, pid file and metadata on normal exit, `SIGTERM` and protocol `Kill`.
+exponential backoff and jitter, detach, `tetherd list`/`kill`, cleanup of the
+socket, pid file and metadata on normal exit, `SIGTERM` and protocol `Kill`,
+`~/.ssh/config` host/user/port/identity-agent/`ProxyCommand` resolution, and the
+client-side SFTP bootstrap of a matching `tetherd` (§11).
 
-Not implemented yet (designed below, do not assume): the client-side bootstrap in
-§11 (there is **no** SFTP/SCP upload, so `tetherd` must already be on the remote
-host), `~/.ssh/config` parsing (§6/§7 — pass `-i`, `-p`, and a literal host), the
-`tether` SSH *subsystem* channel (the client currently execs
-`tetherd attach --session <id> --spawn`), and multi-device attach as a supported
-feature (the daemon has no "one client" lock, but the UX is untested).
+Not implemented yet (designed below, do not assume): the `tether` SSH *subsystem*
+channel (the client execs `tetherd attach --session <id> --spawn`), and
+multi-device attach as a supported feature (the daemon has no "one client" lock,
+but the UX is untested). `ProxyJump` and `Match exec` are not interpreted; a
+literal `ProxyCommand` is.
 
 ## 1. Goals and non-goals
 
@@ -234,9 +235,37 @@ resets to 500 ms after a successful attach that survives one heartbeat interval.
 
 Reconnect re-dials SSH using the user's ssh-agent and identity files
 (`SSH_AUTH_SOCK`, `-i`, or `~/.ssh/id_*`) and re-attaches to the same session id.
-`~/.ssh/config` is not parsed, so use a literal host plus `-i`/`-p`. If the host is
-unreachable the loop continues indefinitely; it never exits on its own while
-disconnected.
+If the host is unreachable the loop continues indefinitely; it never exits on its
+own while disconnected.
+
+### 7.1 Config resolution
+
+`tether [user@]alias` resolves connection settings with first-value-wins
+precedence:
+
+1. Explicit CLI flags (`-p`/`--port`, `-l`/`--user`, `-i`/`--identity`).
+2. The matching `Host`/`Match` block in `~/.ssh/config` (or `--ssh-config PATH`).
+3. Built-in defaults (port 22, current user, the standard keys under `~/.ssh`).
+
+The positional target is split into optional user and alias; a positional user
+that conflicts with `--user` is an error. Unless `--no-ssh-config` is given, the
+alias is looked up with OpenSSH semantics (`user@alias` looks up `alias`).
+`HostName` (falling back to the alias) becomes the dial address,
+`EffectivePort()` the port, `User` the user, and every `IdentityFile` accumulates
+in file order. `IdentityAgent` is honoured unless `-i` was given, with the
+literal `none` disabling the agent. `--ssh-config PATH` naming a missing file is
+an error; a missing default config just yields defaults, and an unknown alias is
+used as a literal host. `--remote-bin` defaults to auto: an explicit path that
+contains `/` is probed only, never installed.
+
+`ProxyCommand` is executed rather than forwarded. The raw value is expanded with
+`sshconfig.Substitute` (`%h`, `%n`, `%p`, `%r`, `%%`; unknown tokens are left
+alone) and run as `/bin/sh -c <cmd>`. Its stdin/stdout become the transport's
+`net.Conn`, and up to 8 KiB of its stderr is retained for error messages.
+Closing that connection closes the pipes and terminates the process (SIGTERM,
+then SIGKILL after 2 s). Because pipe-backed deadlines are not always honoured,
+the heartbeat watchdog closes the channel in addition to setting a deadline, so a
+wedged proxy cannot keep a dead connection parked.
 
 **Escape hatch:** two `Ctrl+C` presses within 2 s *while disconnected* abort the
 retry loop and restore the terminal. `Ctrl+C` while connected is ordinary data
@@ -317,7 +346,7 @@ Security properties:
 - **The log is untrusted output.** It can contain anything the shell printed,
   including escape sequences; never `cat` it into a terminal that matters.
 - **Bootstrap** only stages a binary the user already trusts over the user's own
-  authenticated SSH connection, with `chmod 0700`.
+  authenticated SSH connection, with `chmod 0755` under `~/.local/bin`.
 
 ## 10. Policies
 
@@ -361,18 +390,35 @@ single `Write` call but does not add locking; callers serialise.
 | Reconnect backoff | 500 ms doubling to 5 s, ±20 % |
 | Attach queue wait | 5 s, then `TypeError` |
 
-## 11. Bootstrap (client-side) — planned, not in v0.1.0
+## 11. Bootstrap (client-side)
 
-If `tetherd version` fails on the remote host, `tether` will one day stage it; as
-shipped today it fails with `tetherd not found on <host>; install tetherd or pass
---remote-bin <path>`. The design:
+After the SSH handshake and before starting `attach`, the client makes sure the
+remote has a `tetherd` matching its own `version.Version` and protocol:
 
-1. Detect remote `GOOS`/`GOARCH` (`uname -s`, `uname -m`).
-2. Upload the matching embedded/prebuilt static binary to
-   `~/.tether/bin/tetherd-<version>` over the existing SSH connection (SFTP
-   subsystem, or `cat > file` when it is unavailable).
-3. `chmod 0700`, atomically rename into place, then run `tetherd version` to
-   verify. If verification fails, fall back to plain `ssh` with a clear warning.
+1. Probe `tetherd version` through the login shell (PATH).
+2. Probe `$HOME/.local/bin/tetherd version`.
+3. If neither matches, resolve the remote platform with `uname -s; uname -m`
+   (linux/darwin × amd64/arm64; Linux also accepts arm and 386).
+4. Resolve the asset locally: `--assets-dir`, then the directory of the running
+   `tether`, then `<that dir>/../dist`, then `~/.tether/bin`. Names are
+   `tetherd-<os>-<arch>`, then `tetherd_<os>_<arch>`; the file must be a
+   non-empty regular file with the owner execute bit.
+5. Upload over the SFTP subsystem to a random sibling
+   `tetherd.tmp-<hex>`, `chmod 0755`, then rename onto
+   `$HOME/.local/bin/tetherd` (posix-rename when the server has it, plain
+   rename otherwise), and verify the result with `tetherd version`.
+
+`--no-bootstrap` skips all of this. In auto mode (`--remote-bin` empty or
+`tetherd`) an existing matching binary on `PATH` is reused, so there is no upload
+after the first install unless the version changes. An explicit `--remote-bin`
+containing `/` is probe-only: a mismatch or failed probe is an error and nothing
+is written.
+
+The resolved path is cached for the client lifetime; reconnects do not re-probe
+or re-upload. If the remote `attach` exec fails with status 127 (the binary was
+removed or replaced), the cache is cleared once and Ensure runs again. The
+install notice (`tether: installed tetherd <version> (<os>/<arch>) on <host>`)
+goes to stderr when stderr is a TTY or `--verbose` is set, never to stdout.
 
 ## 12. Planned package layout
 
@@ -380,6 +426,8 @@ shipped today it fails with `tetherd not found on <host>; install tetherd or pas
 cmd/tether        local client CLI
 cmd/tetherd       remote daemon CLI (serve | attach | list | kill | version)
 internal/client   raw-mode terminal, SSH transport, reconnect loop, detach parser
+internal/bootstrap remote tetherd probe and SFTP install
+internal/sshconfig ~/.ssh/config resolution and ProxyCommand token expansion
 internal/daemon   session, PTY, socket server, detached spawn, bridge
 internal/proto    framed wire protocol
 internal/ringbuf  seq-numbered circular buffer
@@ -389,5 +437,7 @@ internal/version  build version and protocol version
 `creack/pty` is used directly; there is no `internal/pty` wrapper.
 
 Dependency direction is strictly one-way: `cmd/*` → `internal/{client,daemon}` →
-`internal/{proto,ringbuf,version}`. `proto` never imports `ringbuf`; sequence
-numbers travel as plain `uint64` fields.
+`internal/{proto,ringbuf,version}`. `client` additionally depends on
+`internal/{bootstrap,sshconfig}`; `bootstrap` reuses `version` and the SFTP/SSH
+libraries. `proto` never imports `ringbuf`; sequence numbers travel as plain
+`uint64` fields.

@@ -4,3 +4,8 @@
 coverage.out
 .DS_Store
 *.log
+
+# Private local test config & harnesses (never push to GitHub)
+.env.oci
+.local/
+*_local_test.go

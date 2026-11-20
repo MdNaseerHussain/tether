@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MdNaseerHussain/tether/internal/sshconfig"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -55,10 +56,10 @@ type transport struct {
 	closeErr  error
 }
 
-// newTransport dials opts.Host, authenticates, and starts the remote attach
-// command. The raw net.Conn is retained so a dead connection can be forced to
-// fail with SetDeadline.
-func newTransport(ctx context.Context, opts Options) (*transport, error) {
+// newTransport dials opts.Host, authenticates, optionally bootstraps a matching
+// tetherd, and starts the remote attach command. The raw net.Conn is retained so
+// a dead connection can be forced to fail with SetDeadline.
+func newTransport(ctx context.Context, opts Options, bc *bootstrapState) (*transport, error) {
 	addr := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 
 	hostKey, err := hostKeyCallback(opts)
@@ -76,20 +77,23 @@ func newTransport(ctx context.Context, opts Options) (*transport, error) {
 		HostKeyCallback: hostKey,
 	}
 
-	dialer := net.Dialer{Timeout: opts.ConnectTimeout}
-	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	raw, err := dialTransport(ctx, opts, addr)
 	if err != nil {
 		closeIfSet(agentConn)
 		return nil, fmt.Errorf("tether: cannot connect to %s: %w", addr, err)
 	}
 
-	// The TCP connect timeout does not cover the SSH handshake, so bound the
-	// whole exchange with a deadline on the raw socket.
+	// The connect timeout does not cover the SSH handshake, so bound the
+	// whole exchange with a deadline on the raw socket. Proxy transports may
+	// ignore it, in which case the handshake's own read deadline applies.
 	if opts.ConnectTimeout > 0 {
 		_ = raw.SetDeadline(time.Now().Add(opts.ConnectTimeout))
 	}
 	conn, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
 	if err != nil {
+		if pc, ok := raw.(*proxyConn); ok {
+			err = proxyError(err, pc.stderr)
+		}
 		raw.Close()
 		closeIfSet(agentConn)
 		return nil, fmt.Errorf("tether: SSH handshake with %s failed: %w", addr, err)
@@ -103,6 +107,15 @@ func newTransport(ctx context.Context, opts Options) (*transport, error) {
 		closeIfSet(agentConn)
 		return nil, fmt.Errorf("tether: %s: %w", stage, err)
 	}
+
+	remoteBin := opts.RemoteBin
+	if !opts.NoBootstrap {
+		remoteBin, err = bc.ensure(ctx, client, opts)
+		if err != nil {
+			return fail("bootstrap tetherd", err)
+		}
+	}
+	opts.RemoteBin = remoteBin
 
 	sess, err := client.NewSession()
 	if err != nil {
@@ -131,6 +144,23 @@ func newTransport(ctx context.Context, opts Options) (*transport, error) {
 		out:    out,
 		agent:  agentConn,
 	}, nil
+}
+
+// dialTransport opens the TCP connection to addr, or runs the configured
+// ProxyCommand and speaks SSH over its stdio.
+func dialTransport(ctx context.Context, opts Options, addr string) (net.Conn, error) {
+	proxy := strings.TrimSpace(opts.ProxyCommand)
+	if proxy == "" || strings.EqualFold(proxy, "none") {
+		dialer := net.Dialer{Timeout: opts.ConnectTimeout}
+		return dialer.DialContext(ctx, "tcp", addr)
+	}
+
+	alias := opts.Alias
+	if alias == "" {
+		alias = opts.Host
+	}
+	command := sshconfig.Substitute(proxy, alias, opts.Host, opts.User, opts.Port)
+	return newProxyConn(ctx, command, opts)
 }
 
 // Read implements io.Reader over the remote command's stdout.
@@ -256,7 +286,12 @@ func authMethods(opts Options) ([]ssh.AuthMethod, io.Closer, error) {
 	var methods []ssh.AuthMethod
 	var agentConn io.Closer
 
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+	sock := opts.IdentityAgent
+	if sock == "" {
+		sock = os.Getenv("SSH_AUTH_SOCK")
+	}
+	if sock != "" && !strings.EqualFold(sock, "none") {
+		sock = expandHome(sock)
 		conn, err := net.Dial("unix", sock)
 		if err != nil {
 			opts.logf("ssh-agent %s unavailable: %v", sock, err)
@@ -266,14 +301,17 @@ func authMethods(opts Options) ([]ssh.AuthMethod, io.Closer, error) {
 		}
 	}
 
-	if opts.IdentityFile != "" {
-		path := expandHome(opts.IdentityFile)
-		signer, err := loadSigner(path)
-		if err != nil {
-			closeIfSet(agentConn)
-			return nil, nil, fmt.Errorf("tether: cannot use identity file %s: %w", path, err)
+	files := explicitIdentityFiles(opts)
+	if len(files) > 0 {
+		for _, file := range files {
+			path := expandHome(file)
+			signer, err := loadSigner(path)
+			if err != nil {
+				closeIfSet(agentConn)
+				return nil, nil, fmt.Errorf("tether: cannot use identity file %s: %w", path, err)
+			}
+			methods = append(methods, ssh.PublicKeys(signer))
 		}
-		methods = append(methods, ssh.PublicKeys(signer))
 	} else {
 		for _, path := range defaultIdentityFiles() {
 			signer, err := loadSigner(path)
@@ -332,6 +370,25 @@ func loadSigner(path string) (ssh.Signer, error) {
 		return nil, perr
 	}
 	return ssh.ParsePrivateKeyWithPassphrase(pem, []byte(passphrase))
+}
+
+// explicitIdentityFiles merges the ssh_config list with the legacy single
+// flag. Order is preserved: configuration order first, then -i/--identity when
+// it is not already listed.
+func explicitIdentityFiles(opts Options) []string {
+	files := make([]string, 0, len(opts.IdentityFiles)+1)
+	seen := make(map[string]bool, len(opts.IdentityFiles)+1)
+	for _, path := range opts.IdentityFiles {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		files = append(files, path)
+	}
+	if opts.IdentityFile != "" && !seen[opts.IdentityFile] {
+		files = append(files, opts.IdentityFile)
+	}
+	return files
 }
 
 // defaultIdentityFiles lists the standard key locations that exist.

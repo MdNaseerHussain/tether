@@ -29,6 +29,10 @@ type Options struct {
 	Host           string
 	Port           int
 	IdentityFile   string
+	IdentityFiles  []string
+	IdentityAgent  string
+	ProxyCommand   string
+	Alias          string
 	KnownHostsFile string
 	Insecure       bool
 	Session        string
@@ -37,6 +41,8 @@ type Options struct {
 	Escape         string
 	ConnectTimeout time.Duration
 	Verbose        bool
+	NoBootstrap    bool
+	AssetsDir      string
 
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -109,9 +115,37 @@ func (e *ErrRemoteMissing) Error() string {
 // until the remote child exits, the user detaches, or ctx is cancelled.
 func Run(ctx context.Context, opts Options) error {
 	opts = opts.withDefaults()
-	return runWith(ctx, opts, func(ctx context.Context) (channel, error) {
-		return newTransport(ctx, opts)
-	})
+	bc := &bootstrapState{}
+	return runWithState(ctx, opts, func(ctx context.Context) (channel, error) {
+		return newTransport(ctx, opts, bc)
+	}, bc)
+}
+
+// bootstrapState caches the remote binary resolved by bootstrap.Ensure for the
+// lifetime of one client. Reconnects reuse the path instead of probing and
+// uploading again; only a 127 from the remote exec (the binary vanished or was
+// replaced) clears it for one more Ensure pass.
+type bootstrapState struct {
+	path    string
+	retried bool
+}
+
+// resolved returns the cached remote path, if any.
+func (b *bootstrapState) resolved() string {
+	if b == nil {
+		return ""
+	}
+	return b.path
+}
+
+// retryAfterMissing clears a cached path once so the next dial re-runs Ensure.
+func (b *bootstrapState) retryAfterMissing() bool {
+	if b == nil || b.retried || b.path == "" {
+		return false
+	}
+	b.retried = true
+	b.path = ""
+	return true
 }
 
 func (o Options) withDefaults() Options {
@@ -159,6 +193,12 @@ func (o Options) logf(format string, args ...any) {
 // runWith is Run with an injected dialer so the protocol loop can be tested over
 // an in-memory pipe.
 func runWith(ctx context.Context, opts Options, dial dialFunc) error {
+	return runWithState(ctx, opts, dial, nil)
+}
+
+// runWithState is runWith plus the client-lifetime bootstrap cache. A nil cache
+// means bootstrap is not retried after a 127.
+func runWithState(ctx context.Context, opts Options, dial dialFunc, bc *bootstrapState) error {
 	det, err := NewDetacher(opts.Escape)
 	if err != nil {
 		return err
@@ -295,6 +335,17 @@ func runWith(ctx context.Context, opts Options, dial dialFunc) error {
 			// A working attach resets the backoff so a later blip retries in
 			// 500 ms rather than at the cap.
 			backoff.Reset()
+		}
+
+		// A cached bootstrap path that no longer executes means the remote
+		// binary was removed or replaced under us. Re-run Ensure once rather
+		// than looping on a dead path.
+		if res.kind == resultFatal {
+			var missing *ErrRemoteMissing
+			if errors.As(res.err, &missing) && bc.retryAfterMissing() {
+				tty.statusf("tether: cached tetherd is gone; re-running bootstrap")
+				continue
+			}
 		}
 
 		switch res.kind {
@@ -765,9 +816,13 @@ func (a *attach) writeLoop(stop <-chan struct{}) sessionResult {
 				continue
 			}
 			// Force the parked reads and writes to fail; the reconnect loop
-			// then runs exactly as it does for a broken connection.
+			// then runs exactly as it does for a broken connection. Closing
+			// the channel as well matters for ProxyCommand transports backed
+			// by non-file pipes, where SetDeadline is only advisory: it kills
+			// the proxy process and unblocks a wedged read.
 			silent := time.Since(lastInbound)
 			_ = a.ch.SetDeadline(time.Now())
+			_ = a.ch.Close()
 			return sessionResult{
 				kind: resultReconnect,
 				err:  fmt.Errorf("no reply for %s", silent.Round(time.Second)),

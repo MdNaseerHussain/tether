@@ -426,6 +426,8 @@ func (f *sshFixture) clientArgs() []string {
 		"-l", sshUser,
 		"--known-hosts", f.knownHosts,
 		"--remote-bin", f.tetherdBin,
+		// The harness counts remote execs; bootstrap would add a probe.
+		"--no-bootstrap",
 		"--session", f.session,
 		"--connect-timeout", sshConnectTimeout,
 		"127.0.0.1",

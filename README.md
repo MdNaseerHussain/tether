@@ -16,7 +16,7 @@ When using standard SSH:
 * Existing workarounds like **Mosh** require opening high UDP ports (blocked by corporate firewalls), break native terminal scrollback, and mangle **OSC 52** clipboard synchronization.
 * Workarounds like **`tmux`** hijack terminal mouse selection, split clipboard buffers, and add intrusive keybinding layers.
 
-**`tether` solves this seamlessly.** It is a lightweight, two-binary Go client-daemon pair that runs over the SSH transport you already have: `tether` on your laptop and `tetherd` on the remote host (installed once — v0.1.0 does not upload it for you). When your connection drops, `tetherd` keeps your shell alive on the remote server, buffers output in a rolling ring buffer, and instantly re-attaches and replays missed tokens the second your laptop wakes up.
+**`tether` solves this seamlessly.** It is a lightweight, two-binary Go client-daemon pair that runs over the SSH transport you already have: `tether` on your laptop and `tetherd` on the remote host. On first connect `tether` finds a matching `tetherd`, or uploads one to `~/.local/bin/tetherd` over SFTP without root; there is nothing to install by hand. When your connection drops, `tetherd` keeps your shell alive on the remote server, buffers output in a rolling ring buffer, and instantly re-attaches and replays missed tokens the second your laptop wakes up.
 
 ---
 
@@ -66,7 +66,7 @@ When using standard SSH:
 ```
 
 1. **Local Client (`tether`):** Switches your local terminal into raw mode and captures signals (like `SIGWINCH` for terminal resizing). It authenticates over standard SSH using `ssh-agent`, an identity file (`-i`), the default keys under `~/.ssh`, or an interactive password prompt, then runs `tetherd attach` on the remote host.
-2. **Server Daemon (`tetherd`):** Started on the remote server by the client with `tetherd attach --spawn`, or explicitly with `tetherd serve`. **It must already be installed on the remote host.** It creates a Unix Pseudo-Terminal (PTY) and spawns your shell in its own process session (`setsid`), so it outlives the SSH channel.
+2. **Server Daemon (`tetherd`):** Started on the remote server by the client with `tetherd attach --spawn`, or explicitly with `tetherd serve`. If no matching binary is on the remote host, the client probes `$PATH` and `~/.local/bin`, then uploads a matching `tetherd` (mode 0755) over SFTP. It creates a Unix Pseudo-Terminal (PTY) and spawns your shell in its own process session (`setsid`), so it outlives the SSH channel.
 3. **Rolling Stream Buffer:** Terminal output is continuously pushed into an in-memory rolling ring buffer (default: 4 MB). If the client disconnects, stdout writes do not block or fail.
 4. **Resumption Handshake:** When your laptop wakes up, `tether` re-dials SSH and re-authenticates with your agent/keys (there is no session token to store), attaches to the same session id, synchronizes terminal window dimensions, and replays unacknowledged bytes from the last acknowledged sequence number.
 
@@ -91,27 +91,37 @@ Download the latest static binary for macOS (`arm64`/`amd64`) or Linux (`amd64`/
 
 ### 2. Usage
 
-`tether` takes the same `[user@]host` shape as `ssh`, plus its own flags:
+`tether` takes the same `[user@]host` shape as `ssh` — an `~/.ssh/config` alias
+or a literal host — plus its own flags:
 
 ```bash
-# Attach to (or create) the "default" session on the remote host.
-# tetherd must already be on the remote $PATH (see Development).
-tether user@cloudtop.corp.internal
+# Attach to (or create) the "default" session using an ssh_config alias.
+# tetherd is uploaded to ~/.local/bin/tetherd automatically if it is missing
+# or does not match this client's version.
+tether cloudtop
 
 # Custom key + port, and a named session.
 tether -i ~/.ssh/id_ed25519 -p 2222 --session dev developer@devbox.internal
 
-# Remote binary outside $PATH, or a non-default known_hosts file.
-tether --remote-bin ~/.local/bin/tetherd --known-hosts ~/.ssh/known_hosts user@host
+# Keep an explicitly installed remote binary, or skip bootstrapping entirely.
+tether --remote-bin /opt/bin/tetherd host
+tether --no-bootstrap host
 
-# Explicit user (same as user@host), custom detach sequence, and a larger buffer
-# for the session if it has to be created.
+# Point at a non-default ssh_config, or ignore it completely.
+tether --ssh-config ~/.ssh/config.work work-host
+tether --no-ssh-config 10.0.0.5
+
+# Custom detach sequence, and a larger buffer for a newly created session.
 tether -l deploy --escape '~^' --buffer-size 8388608 host.example.com
 ```
 
-Host, user, port and key are resolved from these flags, your ssh-agent and the
-default keys under `~/.ssh`; `~/.ssh/config` aliases and `ProxyJump` are **not**
-parsed. Pass `--insecure` only to skip host-key verification for a throwaway host.
+Host, user, port, identity files, `IdentityAgent` and `ProxyCommand` are
+resolved from `~/.ssh/config` the way `ssh` resolves them (first value wins;
+`IdentityFile` accumulates). Explicit flags win over the config, which wins over
+the built-in defaults; `user@alias` overrides the config user. Authentication
+still goes agent → identity files → interactive password on `/dev/tty`, and
+`ProxyCommand` runs through `/bin/sh` with `%h`, `%n`, `%p`, `%r` substituted.
+Pass `--insecure` only to skip host-key verification for a throwaway host.
 
 ### 3. Verify Resilience
 
@@ -134,7 +144,9 @@ parsed. Pass `--insecure` only to skip host-key verification for a throwaway hos
 * **Native Clipboard (OSC 52):** Uninterrupted bi-directional clipboard sync. Copying text in Vim or terminal tools uses your local system clipboard out of the box.
 * **Invisible UX:** No status bars, no screen splitting, no custom escape keybindings (`Ctrl+B`). Your terminal behaves exactly like a native terminal (`~.` detaches, configurable with `--escape`).
 * **Key- or agent-based reconnect:** A dropped channel is re-dialled with your ssh-agent or on-disk keys; no separate session token is issued or stored.
-* **Requires `tetherd` on the remote host:** Install it once (static binary, no root, no extra port). Automatic remote bootstrap over SFTP is designed ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §11) but **not implemented in v0.1.0**.
+* **Works like `ssh` for setup:** `tether <alias>` honours `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent` and `ProxyCommand` from `~/.ssh/config`; explicit flags override them.
+* **Self-installing remote daemon:** If `tetherd` is missing or mismatched, the client uploads a matching static binary to `~/.local/bin/tetherd` over the authenticated SSH connection. No root, no package manager, no manual copy; `--no-bootstrap` opts out.
+
 
 ---
 
@@ -144,9 +156,14 @@ parsed. Pass `--insecure` only to skip host-key verification for a throwaway hos
 - [x] Core PTY allocation and raw-mode client engine in Go
 - [x] Ring buffer stream capture and sequence replay
 - [x] Reconnection state machine with exponential backoff
-- [ ] Automated remote bootstrap over standard SSH
+- [x] Automated remote bootstrap over standard SSH (SFTP upload to `~/.local/bin/tetherd`)
+- [x] `~/.ssh/config` host, user, port, identity-agent and `ProxyCommand` resolution
 - [ ] Session detachment and multi-device attach support (detach is implemented;
       the daemon accepts concurrent attaches, but multi-device use is not advertised yet)
+
+Limitations are deliberate: there is no Windows client, session state is
+in-memory only (a daemon crash loses the ring buffer), and reconnect
+re-authenticates with ssh-agent or key files — tether stores no session token.
 
 ---
 
@@ -176,8 +193,8 @@ Run the race-enabled test suite:
 make test
 ```
 
-`make check` additionally verifies formatting with `gofmt` and runs `go vet`, which is what CI enforces. `make cross` produces static (`CGO_ENABLED=0`) release binaries for Linux and macOS on `amd64` and `arm64`, and `make install` puts them in `$(go env GOPATH)/bin`.
+`make check` additionally verifies formatting with `gofmt` and runs `go vet`, which is what CI enforces. `make cross` produces static (`CGO_ENABLED=0`) release binaries for Linux and macOS on `amd64` and `arm64`, while `make dist` writes the flat bootstrap assets `dist/tetherd-<os>-<arch>` (and the matching client) that the uploader looks for. `make install` puts both commands in `$(go env GOPATH)/bin`.
 
-Note that `tether` alone is not enough: **`tetherd` must be installed on the remote host** you want to connect to (or reachable on its `PATH`, for example in `~/.local/bin`). The client launches it with `tetherd attach --spawn` over an SSH exec channel, and it is the daemon that keeps the session alive across disconnects. Reconnect re-authenticates with your ssh-agent or key files; no session token is stored.
+The client uploads `tetherd` when the remote host has none or has a different version: it probes `tetherd` on `$PATH`, then `$HOME/.local/bin/tetherd`, derives the platform with `uname -s; uname -m`, and stages a matching asset over SFTP with a temporary name plus an atomic rename. It launches the result with `tetherd attach --spawn` over an SSH exec channel; the daemon keeps the session alive across disconnects. Reconnect re-authenticates with your ssh-agent or key files and reuses the resolved binary path; no session token is stored. Pass `--no-bootstrap`, `--remote-bin <path>`, or `--assets-dir <dir>` to control it.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component design and [docs/PROTOCOL.md](docs/PROTOCOL.md) for the byte-level wire format.

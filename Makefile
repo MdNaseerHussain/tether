@@ -8,7 +8,7 @@ GO       ?= go
 BIN      := bin
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: all build test vet fmt check install cross clean
+.PHONY: all build test vet fmt check install cross dist clean
 
 all: check build
 
@@ -50,6 +50,21 @@ cross:
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build $(GOFLAGS) -trimpath \
 			-ldflags "$(LDFLAGS) -s -w" \
 			-o dist/tether_$${os}_$${arch}/tetherd ./cmd/tetherd; \
+	done
+
+# dist compiles flat, self-describing assets for the bootstrap uploader. The
+# names match bootstrap.AssetName: tetherd-<os>-<arch>.
+dist:
+	@mkdir -p dist
+	@set -e; for p in $(PLATFORMS); do \
+		os=$${p%/*}; arch=$${p#*/}; \
+		echo "building $$os/$$arch"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build $(GOFLAGS) -trimpath \
+			-ldflags "$(LDFLAGS) -s -w" \
+			-o dist/tetherd-$${os}-$${arch} ./cmd/tetherd; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build $(GOFLAGS) -trimpath \
+			-ldflags "$(LDFLAGS) -s -w" \
+			-o dist/tether-$${os}-$${arch} ./cmd/tether; \
 	done
 
 clean:

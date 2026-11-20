@@ -25,7 +25,7 @@ none answer both without a cost in ports, privileges, clipboard, or scrollback.
 | **Mosh** | Roaming laptops on networks that permit UDP; lossy, high-latency links where local echo helps. | Syncs *screen state*, not bytes: no scrollback, OSC 52 breaks, needs UDP 60000–61000, no TCP fallback. |
 | **Eternal Terminal** | Teams willing to run a root-installed daemon and open one extra TCP port for session survival. | Custom TCP **2022** must be reachable; root to install `etserver`; heavyweight C++/Boost/Protobuf stack. |
 | **tmux / screen** | Many sessions, shared sessions, pane layouts, a process tree independent of the network. | Persists the *process*, not the *transport*: manual reattach, plus a keybinding layer and copy-mode. |
-| **tether** | Long-running interactive sessions (especially streaming agents) on locked-down networks, with native terminal behaviour. | Requires `tetherd` on the remote host (auto-bootstrap is not in v0.1.0), in-memory session state (lost if the daemon dies), no persisted history. |
+| **tether** | Long-running interactive sessions (especially streaming agents) on locked-down networks, with native terminal behaviour. | Auto-bootstraps `tetherd` on first use but needs a POSIX remote and a local matching asset; in-memory session state (lost if the daemon dies), no persisted history. |
 
 ---
 
@@ -272,7 +272,7 @@ repaint is the application's business.
 
 | Attribute | Standard SSH | Mosh | Eternal Terminal | tmux / screen | tether |
 | :-- | :-- | :-- | :-- | :-- | :-- |
-| **Transport** | TCP :22 (SSH) | UDP, own SSP protocol after an SSH bootstrap | TCP :2022, custom protocol | SSH :22 carrying a tmux client protocol over a Unix socket | SSH :22 exec channel running `tetherd attach`, framed messages |
+| **Transport** | TCP :22 (SSH) | UDP, own SSP protocol after an SSH bootstrap | TCP :2022, custom protocol | SSH :22 carrying a tmux client protocol over a Unix socket | SSH :22; SFTP only to stage `tetherd`, then an exec channel running `tetherd attach` |
 | **Port / firewall** | 22 only | 22 outbound + UDP **60000–61000** inbound | 22 for bootstrap + TCP **2022** inbound | 22 only | 22 only |
 | **Persistence model** | None | Detached `mosh-server` holding the PTY | Root-installed `etserver` holding the PTY | Detached tmux server holding pane PTYs | `setsid`-detached supervisor per session holding the PTY |
 | **Replay granularity** | None | Screen state (diffs of a terminal model) | Retained session buffer, oldest evicted | Grid + `history-limit` lines | Byte stream from `LastAckSeq`, with explicit `Overrun{from,to}` |
@@ -292,12 +292,20 @@ Figures such as the 1.5 ms latency budget, <25 MB RSS, 4 MiB/32 MiB retention an
 
 A comparison that only lists wins is a brochure.
 
-- **It needs `tetherd` on the remote host.** Today you install it yourself
-  (`make install`, or drop the static binary in `~/.local/bin`). Automatic
-  bootstrap — detect `GOOS`/`GOARCH`, upload over SFTP, `chmod 0700`, verify with
-  `tetherd version` — is designed and roadmapped but **not in v0.1.0**. Without the
-  daemon there is no session; the client exits with a "tetherd not found" error
-  (pass `--remote-bin` if it lives outside `$PATH`).
+- **It needs `tetherd` on the remote host, and installs it for you.** The client
+  probes `tetherd` on `$PATH` and `~/.local/bin/tetherd`, derives the remote
+  platform (`uname -s`, `uname -m`), uploads a matching static asset over SFTP to
+  `~/.local/bin/tetherd`, `chmod 0755`, atomically renames it into place, and
+  verifies it with `tetherd version`. No root and no package manager, but it does
+  need a POSIX remote (no Windows) and a local `tetherd-<os>-<arch>` asset
+  (`make dist`). `--no-bootstrap` disables it; an explicit `--remote-bin <path>`
+  is probed but never written, and a mismatch is an error rather than a fallback.
+- **It is not a general SSH replacement.** `~/.ssh/config` resolution covers
+  `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent` and `ProxyCommand`;
+  `ProxyJump`, `Match exec`, certificate/hostbased auth and agent forwarding are
+  not interpreted. Sessions are per-user and in-memory, and reconnect
+  re-authenticates with ssh-agent or keys — there is no session token or
+  persisted history.
 - **Session state is in memory.** The PTY, ring buffer, and sequence counters live in
   the supervisor. A daemon crash, OOM kill, or host reboot loses the shell and its
   buffer. `tetherd list` reports the stale metadata as `dead`; it cannot resurrect it.
