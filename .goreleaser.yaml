@@ -1,0 +1,127 @@
+# GoReleaser configuration. Validate with `goreleaser check` and dry-run with
+# `goreleaser release --snapshot --clean --skip=publish`.
+version: 2
+
+project_name: tether
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  # The CLI client.
+  - id: tether
+    main: ./cmd/tether
+    binary: tether
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -buildid=
+      - -X github.com/MdNaseerHussain/tether/internal/version.Version={{ .Version }}
+
+  # The daemon, installed as `tetherd`.
+  - id: tetherd
+    main: ./cmd/tetherd
+    binary: tetherd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -buildid=
+      - -X github.com/MdNaseerHussain/tether/internal/version.Version={{ .Version }}
+
+  # The same daemon under the flat, self-describing name that
+  # bootstrap.ResolveAsset searches for next to `tether` (tetherd-<os>-<arch>).
+  - id: tetherd-asset
+    main: ./cmd/tetherd
+    binary: tetherd-{{ .Os }}-{{ .Arch }}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -buildid=
+      - -X github.com/MdNaseerHussain/tether/internal/version.Version={{ .Version }}
+
+# One archive per platform holding all three binaries, so a Homebrew install
+# gets `tether`, `tetherd` and the `tetherd-<os>-<arch>` bootstrap asset.
+archives:
+  - id: tether
+    ids:
+      - tether
+      - tetherd
+      - tetherd-asset
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - docs/*.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "^style:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# Keep GoReleaser output away from the `make dist` bootstrap assets.
+dist: .goreleaser-dist
+
+# Homebrew formula (not a cask), published to MdNaseerHussain/homebrew-tap.
+brews:
+  - name: tether
+    repository:
+      owner: MdNaseerHussain
+      name: homebrew-tap
+      # Supplied by the release workflow's HOMEBREW_TAP_GITHUB_TOKEN secret.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/MdNaseerHussain/tether
+    description: Persistent remote terminal sessions over standard SSH
+    license: MIT
+    # Intentional: the flat per-platform daemon asset must land in Homebrew's
+    # bin next to `tether`, because bootstrap.ResolveAsset looks for
+    # tetherd-<os>-<arch> in the directory of the running binary.
+    install: |
+      bin.install "tether"
+      bin.install "tetherd"
+      bin.install Dir["tetherd-*"]
+    test: |
+      system "#{bin}/tether", "version"
